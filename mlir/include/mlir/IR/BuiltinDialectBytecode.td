@@ -205,6 +205,15 @@ def DistinctAttr : DialectAttribute<(attr
   Attribute:$referencedAttr
 )>;
 
+// Make easy to disable until version number gets added.
+class EnableAffineMapPrintingJune2026<dag d> : DialectType<d>;
+
+def AffineMapAttr : EnableAffineMapPrintingJune2026<(attr
+  WithParser<"succeeded(readAffineMap($_reader, context, $_var))",
+    WithPrinter<"writeAffineMap($_writer, $_name)",
+    WithType<"AffineMap">>>:$value
+)>;
+
 // Types
 // -----
 
@@ -376,6 +385,7 @@ def BuiltinDialectAttributes : DialectAttributes<"Builtin"> {
     SparseElementsAttr,
     DistinctAttr,
     FileLineColRange,
+    AffineMapAttr,
   ];
 }
 
