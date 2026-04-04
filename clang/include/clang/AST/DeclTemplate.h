@@ -2123,7 +2123,6 @@ class ClassTemplatePartialSpecializationDecl
       ASTContext &Context, TagKind TK, DeclContext *DC, SourceLocation StartLoc,
       SourceLocation IdLoc, TemplateParameterList *Params,
       ClassTemplateDecl *SpecializedTemplate, ArrayRef<TemplateArgument> Args,
-      CanQualType CanonInjectedTST,
       ClassTemplatePartialSpecializationDecl *PrevDecl);
 
   ClassTemplatePartialSpecializationDecl(ASTContext &C)
@@ -2140,7 +2139,7 @@ public:
   Create(ASTContext &Context, TagKind TK, DeclContext *DC,
          SourceLocation StartLoc, SourceLocation IdLoc,
          TemplateParameterList *Params, ClassTemplateDecl *SpecializedTemplate,
-         ArrayRef<TemplateArgument> Args, CanQualType CanonInjectedTST,
+         ArrayRef<TemplateArgument> Args,
          ClassTemplatePartialSpecializationDecl *PrevDecl);
 
   static ClassTemplatePartialSpecializationDecl *
