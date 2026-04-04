@@ -3571,7 +3571,13 @@ static QualType checkBuiltinTemplateIdType(
     // Synthesize a new template argument list, removing duplicates.
     for (auto T : Ts.getPackAsArray()) {
       assert(T.getKind() == clang::TemplateArgument::Type);
-      if (!Seen.insert(T.getAsType().getCanonicalType()).second)
+      // FIXME: BTK__builtin_dedup_pack is not considered an alias template, so
+      // the template specialization cannot store a non-canonical underlying
+      // type.
+      // When that is fixed, this can use getCommonSugar so it doesn't preserve
+      // arbitrary sugar.
+      T = Context.getCanonicalTemplateArgument(T);
+      if (!Seen.insert(T.getAsType()).second)
         continue;
       OutArgs.push_back(T);
     }
@@ -4182,8 +4188,7 @@ static bool isTemplateArgumentTemplateParameter(const TemplateArgument &Arg,
 
   case TemplateArgument::Type: {
     QualType Type = Arg.getAsType();
-    const TemplateTypeParmType *TPT =
-        Arg.getAsType()->getAsCanonical<TemplateTypeParmType>();
+    const auto *TPT = dyn_cast<TemplateTypeParmType>(Type);
     return TPT && !Type.hasQualifiers() &&
            TPT->getDepth() == Depth && TPT->getIndex() == Index;
   }
@@ -4206,9 +4211,22 @@ static bool isTemplateArgumentTemplateParameter(const TemplateArgument &Arg,
   llvm_unreachable("unexpected kind of template argument");
 }
 
-static bool isSameAsPrimaryTemplate(TemplateParameterList *Params,
+// This function implements the following rule:
+//
+// C++ 14 [temp.class.spec]p8b3:
+//
+//   -- The argument list of the specialization shall not be identical
+//      to the implicit argument list of the primary template.
+//
+// This rule has since been removed, because it's redundant given CWG1495,
+// but we keep it because it produces better diagnostics and recovery.
+// If the template parameter list is constrained, we ignore this.
+static bool isSameAsPrimaryTemplate(Sema &S, TemplateParameterList *Params,
                                     TemplateParameterList *SpecParams,
                                     ArrayRef<TemplateArgument> Args) {
+  if (SpecParams->hasAssociatedConstraints())
+    return false;
+
   if (Params->size() != Args.size() || Params->size() != SpecParams->size())
     return false;
 
@@ -4235,8 +4253,20 @@ static bool isSameAsPrimaryTemplate(TemplateParameterList *Params,
     if (auto *SpecNTTP =
             dyn_cast<NonTypeTemplateParmDecl>(SpecParams->getParam(I))) {
       auto *NTTP = dyn_cast<NonTypeTemplateParmDecl>(Params->getParam(I));
-      if (!NTTP || NTTP->getType().getCanonicalType() !=
-                       SpecNTTP->getType().getCanonicalType())
+      if (!NTTP ||
+          !S.Context.hasEquivalentType(NTTP->getType(), SpecNTTP->getType()))
+        return false;
+    }
+
+    // For TTPs, further specialization is allowed by the template template
+    // parameter's template-head.
+    if (auto *SpecTTP =
+            dyn_cast<TemplateTemplateParmDecl>(SpecParams->getParam(I))) {
+      auto *TTP = dyn_cast<TemplateTemplateParmDecl>(Params->getParam(I));
+      if (!TTP ||
+          !S.TemplateParameterListsAreEqual(
+              TTP->getTemplateParameters(), SpecTTP->getTemplateParameters(),
+              /*Complain=*/false, Sema::TPL_TemplateParamsEquivalent))
         return false;
     }
   }
@@ -4417,32 +4447,34 @@ DeclResult Sema::ActOnVarTemplateSpecialization(
                                 /*UpdateArgsWithConversions=*/true))
     return true;
 
+  // Only needed for partial specializations.
+  SmallVector<TemplateArgument, 4> FunctionallyEquivalentConverted;
+
   // Find the variable template (partial) specialization declaration that
   // corresponds to these arguments.
   if (IsPartialSpecialization) {
     if (CheckTemplatePartialSpecializationArgs(TemplateNameLoc, VarTemplate,
                                                TemplateArgs.size(),
-                                               CTAI.CanonicalConverted))
+                                               CTAI.SugaredConverted))
       return true;
 
     // FIXME: Move these checks to CheckTemplatePartialSpecializationArgs so
     // we also do them during instantiation.
     if (!Name.isDependent() &&
         !TemplateSpecializationType::anyDependentTemplateArguments(
-            TemplateArgs, CTAI.CanonicalConverted)) {
+            TemplateArgs, CTAI.SugaredConverted)) {
       Diag(TemplateNameLoc, diag::err_partial_spec_fully_specialized)
           << VarTemplate->getDeclName();
       IsPartialSpecialization = false;
     }
 
-    if (isSameAsPrimaryTemplate(VarTemplate->getTemplateParameters(),
-                                TemplateParams, CTAI.CanonicalConverted) &&
-        (!Context.getLangOpts().CPlusPlus20 ||
-         !TemplateParams->hasAssociatedConstraints())) {
-      // C++ [temp.class.spec]p9b3:
-      //
-      //   -- The argument list of the specialization shall not be identical
-      //      to the implicit argument list of the primary template.
+    FunctionallyEquivalentConverted = CTAI.SugaredConverted;
+    Context.canonicalizeTemplateArguments(FunctionallyEquivalentConverted,
+                                          CanonicalizationKind::Functional);
+
+    if (isSameAsPrimaryTemplate(*this, VarTemplate->getTemplateParameters(),
+                                TemplateParams,
+                                FunctionallyEquivalentConverted)) {
       Diag(TemplateNameLoc, diag::err_partial_spec_args_match_primary_template)
           << /*variable template*/ 1
           << /*is definition*/ (SC != SC_Extern && !CurContext->isRecord())
@@ -4458,7 +4490,7 @@ DeclResult Sema::ActOnVarTemplateSpecialization(
 
   if (IsPartialSpecialization)
     PrevDecl = VarTemplate->findPartialSpecialization(
-        CTAI.CanonicalConverted, TemplateParams, InsertPos);
+        FunctionallyEquivalentConverted, TemplateParams, InsertPos);
   else
     PrevDecl =
         VarTemplate->findSpecialization(CTAI.CanonicalConverted, InsertPos);
@@ -4488,7 +4520,7 @@ DeclResult Sema::ActOnVarTemplateSpecialization(
         VarTemplatePartialSpecializationDecl::Create(
             Context, VarTemplate->getDeclContext(), TemplateKWLoc,
             TemplateNameLoc, TemplateParams, VarTemplate, TSI->getType(), TSI,
-            SC, CTAI.CanonicalConverted);
+            SC, FunctionallyEquivalentConverted);
     Partial->setTemplateArgsAsWritten(TemplateArgs);
 
     if (!PrevPartial)
@@ -4900,9 +4932,9 @@ ExprResult Sema::CheckConceptTemplateId(
   DiagnoseUseOfDecl(NamedConcept, ConceptNameInfo.getLoc());
 
   // There's a bug with CTAI.CanonicalConverted.
-  // If the template argument contains a DependentDecltypeType that includes a
+  // If the template argument contains a DecltypeType that includes a
   // TypeAliasType, and the same written type had occurred previously in the
-  // source, then the DependentDecltypeType would be canonicalized to that
+  // source, then the DecltypeType would be canonicalized to that
   // previous type which would mess up the substitution.
   // FIXME: Reland https://github.com/llvm/llvm-project/pull/101782 properly!
   auto *CSD = ImplicitConceptSpecializationDecl::Create(
@@ -8279,7 +8311,7 @@ static bool MatchTemplateParameterKind(
       //   placeholder types
       QualType OldType = S.Context.getUnconstrainedType(OldNTTP->getType());
       QualType NewType = S.Context.getUnconstrainedType(NewNTTP->getType());
-      if (!S.Context.hasSameType(OldType, NewType)) {
+      if (!S.Context.hasEquivalentType(OldType, NewType)) {
         if (Complain) {
           unsigned NextDiag = diag::err_template_nontype_parm_different_type;
           if (TemplateArgLoc.isValid()) {
@@ -8924,14 +8956,14 @@ DeclResult Sema::ActOnClassTemplateSpecialization(
   if (isPartialSpecialization) {
     if (CheckTemplatePartialSpecializationArgs(TemplateNameLoc, ClassTemplate,
                                                TemplateArgs.size(),
-                                               CTAI.CanonicalConverted))
+                                               CTAI.SugaredConverted))
       return true;
 
     // FIXME: Move this to CheckTemplatePartialSpecializationArgs so we
     // also do it during instantiation.
     if (!Name.isDependent() &&
         !TemplateSpecializationType::anyDependentTemplateArguments(
-            TemplateArgs, CTAI.CanonicalConverted)) {
+            TemplateArgs, CTAI.SugaredConverted)) {
       Diag(TemplateNameLoc, diag::err_partial_spec_fully_specialized)
         << ClassTemplate->getDeclName();
       isPartialSpecialization = false;
@@ -8939,15 +8971,23 @@ DeclResult Sema::ActOnClassTemplateSpecialization(
     }
   }
 
+  // Only needed for partial specializations.
+  SmallVector<TemplateArgument, 4> FunctionallyEquivalentConverted;
+
   void *InsertPos = nullptr;
   ClassTemplateSpecializationDecl *PrevDecl = nullptr;
 
-  if (isPartialSpecialization)
+  if (isPartialSpecialization) {
+    FunctionallyEquivalentConverted = CTAI.SugaredConverted;
+    Context.canonicalizeTemplateArguments(FunctionallyEquivalentConverted,
+                                          CanonicalizationKind::Functional);
+
     PrevDecl = ClassTemplate->findPartialSpecialization(
-        CTAI.CanonicalConverted, TemplateParams, InsertPos);
-  else
+        FunctionallyEquivalentConverted, TemplateParams, InsertPos);
+  } else {
     PrevDecl =
         ClassTemplate->findSpecialization(CTAI.CanonicalConverted, InsertPos);
+  }
 
   ClassTemplateSpecializationDecl *Specialization = nullptr;
 
@@ -8975,23 +9015,9 @@ DeclResult Sema::ActOnClassTemplateSpecialization(
     if (!PrevDecl)
       ClassTemplate->AddSpecialization(Specialization, InsertPos);
   } else {
-    CanQualType CanonType = CanQualType::CreateUnsafe(
-        Context.getCanonicalTemplateSpecializationType(
-            ElaboratedTypeKeyword::None,
-            TemplateName(ClassTemplate->getCanonicalDecl()),
-            CTAI.CanonicalConverted));
-    if (Context.hasSameType(
-            CanonType,
-            ClassTemplate->getCanonicalInjectedSpecializationType(Context)) &&
-        (!Context.getLangOpts().CPlusPlus20 ||
-         !TemplateParams->hasAssociatedConstraints())) {
-      // C++ [temp.class.spec]p9b3:
-      //
-      //   -- The argument list of the specialization shall not be identical
-      //      to the implicit argument list of the primary template.
-      //
-      // This rule has since been removed, because it's redundant given DR1495,
-      // but we keep it because it produces better diagnostics and recovery.
+    if (isSameAsPrimaryTemplate(*this, ClassTemplate->getTemplateParameters(),
+                                TemplateParams,
+                                FunctionallyEquivalentConverted)) {
       Diag(TemplateNameLoc, diag::err_partial_spec_args_match_primary_template)
           << /*class template*/ 0 << (TUK == TagUseKind::Definition)
           << FixItHint::CreateRemoval(SourceRange(LAngleLoc, RAngleLoc));
@@ -9009,7 +9035,7 @@ DeclResult Sema::ActOnClassTemplateSpecialization(
     ClassTemplatePartialSpecializationDecl *Partial =
         ClassTemplatePartialSpecializationDecl::Create(
             Context, Kind, DC, KWLoc, TemplateNameLoc, TemplateParams,
-            ClassTemplate, CTAI.CanonicalConverted, CanonType, PrevPartial);
+            ClassTemplate, FunctionallyEquivalentConverted, PrevPartial);
     Partial->setTemplateArgsAsWritten(TemplateArgs);
     SetNestedNameSpecifier(*this, Partial, SS);
     if (TemplateParameterLists.size() > 1 && SS.isSet()) {
