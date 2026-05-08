@@ -5703,10 +5703,48 @@ struct ImmediateCallVisitor : DynamicRecursiveASTVisitor {
 
 struct EnsureImmediateInvocationInDefaultArgs
     : TreeTransform<EnsureImmediateInvocationInDefaultArgs> {
+  using Base = TreeTransform<EnsureImmediateInvocationInDefaultArgs>;
+
   EnsureImmediateInvocationInDefaultArgs(Sema &SemaRef)
       : TreeTransform(SemaRef) {}
 
   bool AlwaysRebuild() { return true; }
+
+  bool rebuiltInitNeedsCleanups() const { return RebuiltInitNeedsCleanups; }
+
+  ExprResult TransformInitializer(Expr *Init, bool NotCopyInit) {
+    if (!Init)
+      return Init;
+
+    // CWG1815 lifetime-extended temporaries are intentionally preserved
+    // past the full-expression; re-binding would defeat the extension.
+    Expr *Inner = Init;
+    if (auto *FE = dyn_cast<FullExpr>(Inner))
+      Inner = FE->getSubExpr();
+    if (auto *MTE = dyn_cast<MaterializeTemporaryExpr>(Inner);
+        MTE && MTE->getExtendingDecl()) {
+      llvm::SaveAndRestore Suppress(SuppressRebuiltTemporaryCleanup, true);
+      return Base::TransformInitializer(Init, NotCopyInit);
+    }
+
+    ExprResult Res = Base::TransformInitializer(Init, NotCopyInit);
+    if (Res.isInvalid() || SuppressRebuiltTemporaryCleanup)
+      return Res;
+
+    // Base TransformInitializer strips CXXBindTemporaryExpr from the
+    // rebuilt initializer. Re-bind so end-of-full-expression destruction
+    // still fires after the in-place DMI rebuild. The rebuild path
+    // sometimes re-binds on its own (e.g. via BuildCallExpr); avoid
+    // double-binding in that case.
+    if (isa<CXXBindTemporaryExpr>(Res.get())) {
+      RebuiltInitNeedsCleanups = true;
+      return Res;
+    }
+    ExprResult Bound = SemaRef.MaybeBindToTemporary(Res.get());
+    if (!Bound.isInvalid() && isa<CXXBindTemporaryExpr>(Bound.get()))
+      RebuiltInitNeedsCleanups = true;
+    return Bound;
+  }
 
   // Lambda can only have immediate invocations in the default
   // args of their parameters, which is transformed upon calling the closure.
@@ -5741,6 +5779,10 @@ struct EnsureImmediateInvocationInDefaultArgs
     return getDerived().RebuildSourceLocExpr(
         E->getIdentKind(), E->getType(), E->getBeginLoc(), E->getEndLoc(), DC);
   }
+
+private:
+  bool RebuiltInitNeedsCleanups = false;
+  bool SuppressRebuiltTemporaryCleanup = false;
 };
 
 ExprResult Sema::BuildCXXDefaultArgExpr(SourceLocation CallLoc,
@@ -5882,6 +5924,8 @@ ExprResult Sema::BuildCXXDefaultInitExpr(SourceLocation Loc, FieldDecl *Field) {
   if (!NestedDefaultChecking)
     V.TraverseDecl(Field);
 
+  bool RebuiltInitNeedsCleanups = false;
+
   // CWG1815
   // Support lifetime extension of temporary created by aggregate
   // initialization using a default member initializer. We should rebuild
@@ -5914,6 +5958,7 @@ ExprResult Sema::BuildCXXDefaultInitExpr(SourceLocation Loc, FieldDecl *Field) {
       Field->setInvalidDecl();
       return ExprError();
     }
+    RebuiltInitNeedsCleanups = Immediate.rebuiltInitNeedsCleanups();
     Init = Res.get();
   }
 
@@ -5923,8 +5968,11 @@ ExprResult Sema::BuildCXXDefaultInitExpr(SourceLocation Loc, FieldDecl *Field) {
       runWithSufficientStackSpace(Loc, [&] {
         MarkDeclarationsReferencedInExpr(E, /*SkipLocalVariables=*/false);
       });
-    if (isInLifetimeExtendingContext())
+    if (isInLifetimeExtendingContext()) {
       DiscardCleanupsInEvaluationContext();
+      if (RebuiltInitNeedsCleanups)
+        Cleanup.setExprNeedsCleanups(true);
+    }
     // C++11 [class.base.init]p7:
     //   The initialization of each base and member constitutes a
     //   full-expression.
