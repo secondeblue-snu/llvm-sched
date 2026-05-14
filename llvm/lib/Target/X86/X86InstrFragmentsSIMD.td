@@ -1254,10 +1254,11 @@ def extloadv4f16 : PatFrag<(ops node:$ptr), (extloadvf16 node:$ptr)>;
 def extloadv8f16 : PatFrag<(ops node:$ptr), (extloadvf16 node:$ptr)>;
 def extloadv16f16 : PatFrag<(ops node:$ptr), (extloadvf16 node:$ptr)>;
 
-// Like 'store', but always requires vector size alignment.
-def alignedstore : PatFrag<(ops node:$val, node:$ptr),
-                           (store node:$val, node:$ptr), [{
-  auto *St = cast<StoreSDNode>(N);
+// Like 'store' or 'atomic_store', but always requires vector size alignment.
+def alignedstore : PatFrags<(ops node:$val, node:$ptr),
+                            [(store node:$val, node:$ptr),
+                             (atomic_store node:$val, node:$ptr)], [{
+  auto *St = cast<MemSDNode>(N);
   return St->getAlign() >= St->getMemoryVT().getStoreSize();
 }]> {
   let GISelPredicateCode = [{
