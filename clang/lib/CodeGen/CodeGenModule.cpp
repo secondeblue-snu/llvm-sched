@@ -78,6 +78,7 @@
 #include "llvm/Transforms/Instrumentation/KCFI.h"
 #include "llvm/Transforms/Utils/BuildLibCalls.h"
 #include "llvm/Transforms/Utils/KCFIHash.h"
+#include "llvm/Transforms/Utils/ModuleUtils.h"
 #include <optional>
 #include <set>
 
@@ -1737,6 +1738,9 @@ void CodeGenModule::Release() {
   EmitBackendOptionsMetadata(getCodeGenOpts());
 
   EmitLoadTimeComment();
+
+  // Emit loadtime comment variables specified via -mloadtime-comment-vars.
+  EmitLoadTimeCommentVars();
 
   // If there is device offloading code embed it in the host now.
   EmbedObject(&getModule(), CodeGenOpts, *getFileSystem(), getDiags());
@@ -4234,6 +4238,79 @@ void CodeGenModule::EmitLoadTimeComment() {
   if (LoadTimeComment) {
     auto *NMD = getModule().getOrInsertNamedMetadata("comment_string.loadtime");
     NMD->addOperand(LoadTimeComment);
+  }
+}
+
+/// Check if a variable declaration is suitable to be treated as a loadtime
+/// comment variable. Valid variables must be character pointers or character
+/// arrays with an initializer.
+bool CodeGenModule::isValidLoadTimeCommentVariable(const VarDecl *D) const {
+  // Must be a valid declaration and must have an initializer (the string).
+  if (!D || !D->hasInit())
+    return false;
+
+  QualType Ty = D->getType();
+
+  // 1. Handle Pointers (e.g., char *sccsid, const char *copyright).
+  if (const PointerType *PT = Ty->getAs<PointerType>()) {
+    if (PT->getPointeeType()->isAnyCharacterType())
+      return true;
+  }
+
+  // 2. Handle Arrays (e.g., char version[])
+  // use ASTContext::getAsArrayType to safely unwrap constant arrays.
+  if (const ArrayType *AT = getContext().getAsArrayType(Ty)) {
+    if (AT->getElementType()->isAnyCharacterType())
+      return true;
+  }
+
+  return false; // Reject ints, structs, etc.
+}
+
+/// Emit global variables specified via -mloadtime-comment-vars as loadtime
+/// comment variables. These variables are tagged with metadata and marked as
+/// used to prevent garbage collection. Only valid on AIX.
+void CodeGenModule::EmitLoadTimeCommentVars() {
+  if (!getTriple().isOSAIX())
+    return;
+
+  const auto &LoadTimeCommentVars = getCodeGenOpts().LoadTimeCommentVars;
+  if (LoadTimeCommentVars.empty())
+    return;
+
+  TranslationUnitDecl *TU = getContext().getTranslationUnitDecl();
+  for (auto *D : TU->decls()) {
+    VarDecl *VD = dyn_cast<VarDecl>(D);
+    if (!VD)
+      continue;
+
+    // Check if the variable name is in the loadtime comment vars list.
+    if (!llvm::is_contained(LoadTimeCommentVars, VD->getName()))
+      continue;
+
+    if (!isValidLoadTimeCommentVariable(VD))
+      continue;
+
+    llvm::Constant *Addr = GetAddrOfGlobalVar(VD);
+
+    auto *GV = dyn_cast<llvm::GlobalVariable>(Addr->stripPointerCasts());
+    if (!GV)
+      continue;
+
+    // Force Clang to emit the definition if it skipped it.
+    if (GV->isDeclaration())
+      EmitGlobalDefinition(VD);
+
+    if (GV->isDeclaration())
+      continue;
+
+    // Record the variable name in named module metadata.
+    llvm::NamedMDNode *MD =
+        getModule().getOrInsertNamedMetadata("loadtime_comment.vars");
+    llvm::Metadata *Ops[] = {
+        llvm::MDString::get(getLLVMContext(), VD->getName())};
+    MD->addOperand(llvm::MDNode::get(getLLVMContext(), Ops));
+    llvm::appendToCompilerUsed(getModule(), {GV});
   }
 }
 

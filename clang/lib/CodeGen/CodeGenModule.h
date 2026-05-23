@@ -2172,6 +2172,14 @@ private:
   /// Emit the load-time comment metadata (e.g., from
   /// #pragma comment(copyright, ...)) for the translation unit.
   void EmitLoadTimeComment();
+
+  /// Check if a variable declaration is suitable to be treated as a loadtime
+  /// comment variable (must be a character pointer or array with initializer).
+  bool isValidLoadTimeCommentVariable(const VarDecl *D) const;
+
+  /// Emit global variables specified via -mloadtime-comment-vars as loadtime
+  /// comment variables, tagging them with metadata and preventing removal.
+  void EmitLoadTimeCommentVars();
 };
 
 }  // end namespace CodeGen

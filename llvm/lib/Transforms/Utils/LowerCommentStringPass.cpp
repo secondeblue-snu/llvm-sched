@@ -4,40 +4,84 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-//===---------------------------------------------------------------------===//
+//===----------------------------------------------------------------------===//
 //
-// This pass lowers the module-level comment string metadata emitted by Clang:
+// This pass processes copyright and variable metadata for AIX, handling two
+// distinct mechanisms:
+//
+// 1. #pragma comment(copyright, "...") - TU-wide copyright strings
+// 2. -mloadtime-comment-vars=<names> - User-specified global variables
+//
+// Both types of information must be preserved in the final object file and
+// survive optimization passes including DCE and LTO.
+//
+// === #pragma comment(copyright, "...") ===
+//
+// Clang emits module-level metadata for copyright pragmas:
 //
 //     !comment_string.loadtime = !{!"Copyright ..."}
 //
-// into concrete, translation-unit-local globals.
-// This Pass is enabled only for AIX.
-// For each module (translation unit), the pass performs the following:
+// This pass materializes the metadata into a concrete global variable:
 //
 //   1. Creates a null-terminated, internal constant string global
-//      (`__loadtime_comment_str`) containing the copyright text with
-//      section attribute "__loadtime_comment". The backend places this
-//      in the .text section of the object file.
+//      `__loadtime_comment_str` containing the copyright text with section
+//      attribute "__loadtime_comment". The backend emits this to a special
+//      section in the object file.
 //
-//   2. Marks the string in `llvm.compiler.used` so it cannot be dropped by
-//      optimization or LTO.
+//   2. Marks the global in `llvm.compiler.used` to prevent removal by
+//      optimization passes.
 //
-//   3. Attaches `!implicit.ref` metadata referencing the string to every
-//      defined function in the module. The PowerPC AIX backend recognizes
-//      this metadata and emits a `.ref` directive from the function to the
-//      string, creating a concrete relocation that prevents the linker from
-//      discarding the string (as long as the referencing symbol is kept).
+//   3. Attaches `!implicit.ref` metadata to every defined function,
+//      referencing the global. The PowerPC AIX backend emits a `.ref`
+//      directive for each reference, creating relocations that prevent the
+//      linker from discarding the string.
 //
-//  Input IR:
-//     !comment_string.loadtime = !{!"Copyright"}
-//  Output IR:
-//     @__loadtime_comment_str = internal constant [N x i8] c"Copyright\00",
-//                          section "__loadtime_comment"
-//     @llvm.compiler.used = appending global [1 x ptr] [ptr
-//     @__loadtime_comment_str]
+// === -mloadtime-comment-vars=<names> ===
 //
-//     define i32 @func() !implicit.ref !5 { ... }
-//     !5 = !{ptr @__loadtime_comment_str}
+// Clang stores the names of user-specified global variables (e.g., char
+// *sccsid, char version[]) in module-level metadata:
+//
+//     !loadtime_comment.vars = !{!{!"sccsid"}, !{!"version"}}
+//
+// This pass:
+//
+//   1. Reads the variable names from the metadata and looks up each global
+//      by name using M.getNamedGlobal().
+//
+//   2. Attaches `!implicit.ref` metadata to every defined function,
+//      referencing each tagged global. This ensures the variables survive
+//      optimization and linking.
+//
+// === Output Example ===
+//
+// Input IR:
+//
+//   @sccsid = internal global ptr @.str, align 8
+//   @.str = private unnamed_addr constant [24 x i8] c"@(#) sccsid
+//   Version 1.0\00", align 1
+//   @llvm.compiler.used = appending global [1 x ptr] [ptr @sccsid], section
+//   "llvm.metadata"
+//   !comment_string.loadtime = !{!1}
+//   !loadtime_comment.vars = !{!2}
+//   !1 = !{!"Pragma comment copyright"}
+//   !2 = !{!"sccsid"}
+//
+// Output IR:
+//   @sccsid = internal global ptr @.str, align 8
+//   @.str = private unnamed_addr constant [24 x i8] c"@(#) sccsid
+//   Version 1.0\00", align 1
+//   @__loadtime_comment_str = internal unnamed_addr constant [25 x i8]
+//   c"Pragma comment copyright\00", section "__loadtime_comment", align 1
+//   @llvm.compiler.used = appending global [2 x ptr] [ptr @sccsid, ptr
+//   @__loadtime_comment_str], section "llvm.metadata"
+//
+//   define void @foo() !implicit.ref !1 !implicit.ref !2 {
+//   entry:
+//     ret void
+//   }
+//
+//   !1 = !{ptr @__loadtime_comment_str}
+//   !2 = !{ptr @sccsid}
 //
 //===----------------------------------------------------------------------===//
 
@@ -83,68 +127,118 @@ PreservedAnalyses LowerCommentStringPass::run(Module &M,
 
   LLVMContext &Ctx = M.getContext();
 
-  // Single-metadata: !comment_string.loadtime = !{!0}
-  // Each operand node is expected to have one MDString operand.
+  // This pass processes two types of copyright/identifying information:
+  // 1. A single TU-wide copyright string from #pragma comment(copyright, "...")
+  // 2. Multiple user-specified variables from -mloadtime-comment-vars=...
+  //
+  // Both need implicit references from every function to survive DCE and LTO.
+  // Collect all copyright globals, then create implicit references
+  // from every function definition to each global. This forces the backend
+  // to treat them as reachable and preserve them in the final object file.
+  SmallVector<GlobalValue *, 4> CopyrightGlobals;
+
+  // =========================================================================
+  // Process #pragma comment(copyright, "...") - at most one per TU
+  // =========================================================================
+  // Frontend emits module-level metadata:
+  //   !comment_string.loadtime = !{!0}
+  //   !0 = !{!"Copyright text here"}
+  //
+  // We materialize this as a global string in the __loadtime_comment section,
+  // which linkers recognize and include in the object file's loadtime
+  // comment area.
   NamedMDNode *MD = M.getNamedMetadata("comment_string.loadtime");
-  if (!MD || MD->getNumOperands() == 0)
-    return PreservedAnalyses::all();
+  if (MD && MD->getNumOperands() > 0) {
+    MDNode *MdNode = MD->getOperand(0);
+    if (MdNode && MdNode->getNumOperands() > 0) {
+      auto *MdString = dyn_cast_or_null<MDString>(MdNode->getOperand(0));
+      if (MdString && !MdString->getString().empty()) {
+        StringRef Text = MdString->getString();
+        // Create a null-terminated string constant in the special section.
+        Constant *StrInit =
+            ConstantDataArray::getString(Ctx, Text, /*AddNull*/ true);
+        // The global variable should be internal, constant, and TU-local.
+        // This avoids duplicate symbol issues across TUs.
+        auto *StrGV = new GlobalVariable(M, StrInit->getType(),
+                                         /*isConstant=*/true,
+                                         GlobalValue::InternalLinkage, StrInit,
+                                         /*Name=*/"__loadtime_comment_str");
+        StrGV->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+        StrGV->setAlignment(Align(1));
+        // Backend recognizes this section and emits it to .loadtime_comment.
+        StrGV->setSection("__loadtime_comment");
+        // Prevent removal by optimizer passes (but not sufficient for linker).
+        appendToCompilerUsed(M, {StrGV});
+        // Add to list - will get implicit refs from all functions below.
+        CopyrightGlobals.push_back(StrGV);
+      }
+    }
+    // Clean up the metadata as we have consumed it.
+    MD->eraseFromParent();
+  }
 
-  // At this point we are guaranteed that one TU contains a single copyright
-  // metadata entry. Create TU-local string global for that metadata entry.
-  MDNode *MdNode = MD->getOperand(0);
-  if (!MdNode || MdNode->getNumOperands() == 0)
-    return PreservedAnalyses::all();
+  // =========================================================================
+  // Process -mloadtime-comment-vars=sccsid,version,... (CLI flag)
+  // =========================================================================
+  // Frontend stores variable names in named metadata:
+  //   !loadtime_comment.vars = !{!{!"sccsid"}, !{!"version"}}
+  //
+  // We look each name up by M.getNamedGlobal() rather than walking globals
+  // looking for per-global metadata, because per-global metadata is droppable
+  // and may be stripped by optimization passes before this pass runs.
+  NamedMDNode *VarsMD = M.getNamedMetadata("loadtime_comment.vars");
+  if (VarsMD) {
+    for (unsigned I = 0, E = VarsMD->getNumOperands(); I < E; ++I) {
+      MDNode *Entry = VarsMD->getOperand(I);
+      if (!Entry || Entry->getNumOperands() == 0)
+        continue;
 
-  auto *MdString = dyn_cast_or_null<MDString>(MdNode->getOperand(0));
-  if (!MdString)
-    return PreservedAnalyses::all();
+      auto *VarName = dyn_cast_or_null<MDString>(Entry->getOperand(0));
+      if (!VarName || VarName->getString().empty())
+        continue;
 
-  StringRef Text = MdString->getString();
-  if (Text.empty())
-    return PreservedAnalyses::all();
+      GlobalValue *GV = M.getNamedGlobal(VarName->getString());
+      if (!GV || GV->isDeclaration())
+        continue;
 
-  // 1. Create a single null-terminated string global.
-  Constant *StrInit = ConstantDataArray::getString(Ctx, Text, /*AddNull=*/true);
+      appendToCompilerUsed(M, {GV});
 
-  // The global variable should be internal, constant, and TU-local.
-  // This avoids duplicate symbol issues across TUs.
-  auto *StrGV = new GlobalVariable(M, StrInit->getType(),
-                                   /*isConstant=*/true,
-                                   GlobalValue::InternalLinkage, StrInit,
-                                   /*Name=*/"__loadtime_comment_str");
-  // Set unnamed_addr to allow the linker to merge identical strings.
-  StrGV->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
-  StrGV->setAlignment(Align(1));
-  // Place in the "__loadtime_comment" section.
-  // The GV is constant, so we expect a read-only section.
-  StrGV->setSection("__loadtime_comment");
+      CopyrightGlobals.push_back(GV);
+    }
+    VarsMD->eraseFromParent();
+  }
 
-  // 2. Add the string to llvm.compiler.used to prevent LLVM optimization/LTO
-  // passes from removing it.
-  appendToCompilerUsed(M, {StrGV});
-
-  // 3. Attach !implicit.ref metadata to every defined function.
-  // Create a metadata node pointing to the copyright string:
-  //   !N = !{ptr @__loadtime_comment_str}
-  Metadata *Ops[] = {ConstantAsMetadata::get(StrGV)};
-  MDNode *ImplicitRefMD = MDNode::get(Ctx, Ops);
-
-  auto AddImplicitRef = [&](Function &F) {
+  // =========================================================================
+  // Create implicit references from every function to each global
+  // =========================================================================
+  // Each implicit.ref node references exactly ONE global. Multiple nodes
+  // can be attached to a single function (e.g., !implicit.ref !1, !implicit.ref
+  // !2).
+  auto AddImplicitRef = [&](Function &F, GlobalValue *GV) {
     if (F.isDeclaration())
       return;
-    // Attach the !implicit.ref metadata to the function.
-    F.setMetadata(LLVMContext::MD_implicit_ref, ImplicitRefMD);
-    LLVM_DEBUG(dbgs() << "[copyright] attached implicit.ref to function:  "
-                      << F.getName() << "\n");
+    // Create metadata: !N = !{ptr @global_variable}
+    Metadata *Ops[] = {ConstantAsMetadata::get(GV)};
+    MDNode *NewMD = MDNode::get(Ctx, Ops);
+    // Attach to function - addMetadata allows multiple !implicit.ref nodes per
+    // function, one for each copyright global.
+    F.addMetadata(LLVMContext::MD_implicit_ref, *NewMD);
+
+    LLVM_DEBUG(dbgs() << "[copyright] attached implicit.ref to function: "
+                      << F.getName() << " for global: " << GV->getName()
+                      << "\n");
   };
 
-  // Process all functions in the module and add !implicit.ref to the function.
-  for (Function &F : M)
-    AddImplicitRef(F);
+  // Apply implicit references: for each global, mark all functions as users.
+  if (!CopyrightGlobals.empty()) {
+    for (GlobalValue *GV : CopyrightGlobals) {
+      for (Function &F : M)
+        AddImplicitRef(F, GV);
+    }
+  }
 
-  // Cleanup the processed metadata.
-  MD->eraseFromParent();
-  LLVM_DEBUG(dbgs() << "[copyright] created string and anchor for module\n");
+  LLVM_DEBUG(dbgs() << "[copyright] processed " << CopyrightGlobals.size()
+                    << " copyright globals\n");
 
   return PreservedAnalyses::all();
 }
