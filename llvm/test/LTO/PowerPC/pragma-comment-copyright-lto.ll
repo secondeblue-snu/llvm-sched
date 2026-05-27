@@ -64,22 +64,26 @@ entry:
 !1 = !{i32 8, !"PIC Level", i32 2}
 !2 = !{i32 1, !"EnableSplitLTOUnit", i32 1}
 
-;; f_add csect anchors TU1 copyright string
+;; f_add csect anchors TU1 copyright string.
 ; CHECK-LABEL: .f_add:
-; CHECK-NEXT:  .ref __loadtime_comment_str
+; CHECK-NEXT:  .ref [[TU1_STR:__loadtime_comment_str_[0-9a-f]+]]
 
-;; f_unused is DCE'd -- must not appear in assembly
-; CHECK-NOT: .f_unused:
-
-;; main anchors both strings: TU2's own and TU1's via inlined f_add
+;; main anchors both strings: TU2's own and TU1's via inlined f_add.
 ; CHECK-LABEL: .main:
-; CHECK:       .ref __loadtime_comment_str.2
-; CHECK:       .ref __loadtime_comment_str
+; CHECK-DAG:   .ref [[TU1_STR]]
+; CHECK-DAG:   .ref [[TU2_STR:__loadtime_comment_str_[0-9a-f]+]]
 
-;; f_add(1,2) constant-folded -- no optimization regression with pragma
+;; f_add(1,2) constant-folded -- no optimization regression with pragma.
 ; CHECK:       li 3, 3
 
-;; Both copyright strings in the read-only __loadtime_comment csect
-; CHECK:      .csect __loadtime_comment[RO]
-; CHECK-DAG:  .string "Copyright TU1"
-; CHECK-DAG:  .string "Copyright TU2"
+;; Both copyright strings in the read-only __loadtime_comment csect.
+; CHECK:       .csect __loadtime_comment[RO]
+; CHECK-NEXT:  .lglobl [[TU1_STR]]
+; CHECK:       [[TU1_STR]]:
+; CHECK-NEXT:  .string "Copyright TU1"
+; CHECK-NEXT:  .lglobl [[TU2_STR]]
+; CHECK:       [[TU2_STR]]:
+; CHECK-NEXT:  .string "Copyright TU2"
+
+;; f_unused is DCE'd -- must not appear in assembly.
+; CHECK-NOT:   .f_unused:
