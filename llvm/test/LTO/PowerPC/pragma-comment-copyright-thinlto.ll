@@ -1,15 +1,6 @@
-; llvm/test/LTO/PowerPC/pragma-comment-copyright-thinlto.ll
-;;
-;; ThinLTO test for #pragma comment(copyright, ...) on AIX.
-;;
-;; Tests that copyright strings survive ThinLTO with the
-;; ModuleSummaryAnalysis fix (findImplicitRefEdges) that adds
-;; !implicit.ref-referenced globals as explicit reference edges
-;; in the ThinLTO summary, keeping them live.
-;;
-;; f_add is notEligibleToImport because it references an internal
-;; global (@__loadtime_comment_str) via !implicit.ref. Both copyright
-;; strings still appear in the final binary via the external call path.
+;; ThinLTO test for #pragma comment(copyright, ...).
+;; Tests that Prgam commentcopyright strings from module TU1 gets imported 
+;; to module TU2 and is gets added to TU2's @llvm.compiler.used.
 
 ; REQUIRES: powerpc-registered-target
 
@@ -19,14 +10,14 @@
 ; RUN:   opt -module-summary -o %t/tu1.bc
 ; RUN: opt -passes='thinlto-pre-link<O2>' %t/tu2.ll -o - | \
 ; RUN:   opt -module-summary -o %t/tu2.bc
-; RUN: llvm-lto2 run -filetype=asm \
-; RUN:   -r %t/tu1.bc,f_add,px \
-; RUN:   -r %t/tu1.bc,f_unused,p \
-; RUN:   -r %t/tu2.bc,main,px \
-; RUN:   -r %t/tu2.bc,f_add,l \
-; RUN:   %t/tu1.bc %t/tu2.bc -o %t/out
-; RUN: FileCheck %s --check-prefix=CHECK-TU1 < %t/out.1
-; RUN: FileCheck %s --check-prefix=CHECK-TU2 < %t/out.2
+; RUN: llvm-lto --thinlto-action=thinlink -o combined %t/tu1.bc %t/tu2.bc
+; RUN: llvm-lto --thinlto-action=import  \
+; RUN:         --thinlto-index=combined  \
+; RUN:         --exported-symbol=main    \
+; RUN:         --exported-symbol=f_add   \
+; RUN:         --exported-symbol=my_function \
+; RUN:        %t/tu2.bc -o %t/tu2.imported.bc
+; RUN: llvm-dis %t/tu2.imported.bc -o - | FileCheck %s --check-prefix=CHECK-TU2-IMPORTED
 
 ;--- tu1.ll
 target datalayout = "E-m:a-p:32:32-Fi32-i64:64-n32-f64:32:64"
@@ -38,15 +29,9 @@ entry:
   ret i32 %add
 }
 
-;; f_unused is not exported and never called -- ThinLTO must DCE it
-define void @f_unused() {
-entry:
-  ret void
-}
-
 !comment_string.loadtime = !{!0}
 !llvm.module.flags = !{!1, !2}
-!0 = !{!"Copyright TU1"}
+!0 = !{!"@(#) Copyright TU1"}
 !1 = !{i32 8, !"PIC Level", i32 2}
 !2 = !{i32 1, !"EnableSplitLTOUnit", i32 0}
 
@@ -58,32 +43,25 @@ declare i32 @f_add(i32 noundef, i32 noundef)
 
 define i32 @main() {
 entry:
-  %call = call i32 @f_add(i32 1, i32 2)
+  %call = tail call i32 @f_add(i32 noundef 1, i32 noundef 2)
   ret i32 %call
 }
 
 !comment_string.loadtime = !{!0}
 !llvm.module.flags = !{!1, !2}
-!0 = !{!"Copyright TU2"}
+!0 = !{!"@(#) Copyright TU2"}
 !1 = !{i32 8, !"PIC Level", i32 2}
 !2 = !{i32 1, !"EnableSplitLTOUnit", i32 0}
 
-;; TU1: f_add anchors copyright string, f_unused is DCE'd
-; CHECK-TU1-LABEL: .f_add:
-; CHECK-TU1-NEXT:  .ref __loadtime_comment_str
-; CHECK-TU1-NOT:   .f_unused:
-; CHECK-TU1:       .csect __loadtime_comment[RO]
-; CHECK-TU1:       __loadtime_comment_str:
-; CHECK-TU1-NEXT:  .string "Copyright TU1"
+; CHECK-TU2-IMPORTED: @[[TU2_STR:__loadtime_comment_str_[0-9a-f]+]] = weak_odr unnamed_addr constant [19 x i8] c"@(#) Copyright TU2\00", section "__loadtime_comment", align 1
+; CHECK-TU2-IMPORTED-NEXT: @[[TU1_STR:__loadtime_comment_str_[0-9a-f]+]] = available_externally unnamed_addr constant [19 x i8] c"@(#) Copyright TU1\00", section "__loadtime_comment", align 1
+; CHECK-TU2-IMPORTED-NEXT: @llvm.compiler.used = appending global [2 x ptr] [ptr @[[TU2_STR]], ptr @[[TU1_STR]]], section "llvm.metadata"
 
-;; TU2: main anchors TU2 copyright string
-;; f_add is NOT inlined -- notEligibleToImport because it references
-;; an internal global via !implicit.ref. Cross-boundary call via
-;; .extern .f_add keeps tu1 linked, preserving Copyright TU1.
-; CHECK-TU2:      .ref __loadtime_comment_str
-; CHECK-TU2:      bl .f_add
-; CHECK-TU2:      .csect __loadtime_comment[RO]
-; CHECK-TU2:      __loadtime_comment_str:
-; CHECK-TU2-NEXT: .string "Copyright TU2"
-; CHECK-TU2:      .extern .f_add
-; CHECK-TU2-NOT:  .string "Copyright TU1"
+; CHECK-TU2-IMPORTED-LABEL: define i32 @main()
+; CHECK-TU2-IMPORTED-SAME: local_unnamed_addr !implicit.ref ![[MAIN_MD:[0-9]+]]
+
+; CHECK-TU2-IMPORTED-LABEL: define available_externally i32 @f_add(
+; CHECK-TU2-IMPORTED-SAME: local_unnamed_addr #[[FADD_ATTR:[0-9]+]] !implicit.ref ![[FADD_MD:[0-9]+]]
+
+; CHECK-TU2-IMPORTED: ![[MAIN_MD]] = !{ptr @[[TU2_STR]]}
+; CHECK-TU2-IMPORTED-NEXT: ![[FADD_MD]] = !{ptr @[[TU1_STR]]}

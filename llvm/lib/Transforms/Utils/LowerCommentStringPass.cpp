@@ -23,7 +23,7 @@
 //
 // This pass materializes the metadata into a concrete global variable:
 //
-//   1. Creates a null-terminated, internal constant string global
+//   1. Creates a null-terminated, weak_odr constant string global
 //      `__loadtime_comment_str` containing the copyright text with section
 //      attribute "__loadtime_comment". The backend emits this to a special
 //      section in the object file.
@@ -70,17 +70,17 @@
 //   @sccsid = internal global ptr @.str, align 8
 //   @.str = private unnamed_addr constant [24 x i8] c"@(#) sccsid
 //   Version 1.0\00", align 1
-//   @__loadtime_comment_str = internal unnamed_addr constant [25 x i8]
+//   @__loadtime_comment_str_HASH = weak_odr unnamed_addr constant [25 x i8]
 //   c"Pragma comment copyright\00", section "__loadtime_comment", align 1
 //   @llvm.compiler.used = appending global [2 x ptr] [ptr @sccsid, ptr
-//   @__loadtime_comment_str], section "llvm.metadata"
+//   @__loadtime_comment_str_HASH], section "llvm.metadata"
 //
 //   define void @foo() !implicit.ref !1 !implicit.ref !2 {
 //   entry:
 //     ret void
 //   }
 //
-//   !1 = !{ptr @__loadtime_comment_str}
+//   !1 = !{ptr @__loadtime_comment_str_HASH}
 //   !2 = !{ptr @sccsid}
 //
 //===----------------------------------------------------------------------===//
@@ -103,8 +103,10 @@
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/xxhash.h"
 #include "llvm/TargetParser/Triple.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
+#include <string>
 
 #define DEBUG_TYPE "lower-comment-string"
 
@@ -154,15 +156,21 @@ PreservedAnalyses LowerCommentStringPass::run(Module &M,
       auto *MdString = dyn_cast_or_null<MDString>(MdNode->getOperand(0));
       if (MdString && !MdString->getString().empty()) {
         StringRef Text = MdString->getString();
+        if (Text.empty())
+          return PreservedAnalyses::all();
+
+        uint64_t Hash = xxh3_64bits(Text);
+        std::string GlobalName =
+            ("__loadtime_comment_str_" + Twine::utohexstr(Hash)).str();
         // Create a null-terminated string constant in the special section.
         Constant *StrInit =
             ConstantDataArray::getString(Ctx, Text, /*AddNull*/ true);
-        // The global variable should be internal, constant, and TU-local.
+        // The global variable should be weak_odr, constant, and TU-local.
         // This avoids duplicate symbol issues across TUs.
         auto *StrGV = new GlobalVariable(M, StrInit->getType(),
                                          /*isConstant=*/true,
-                                         GlobalValue::InternalLinkage, StrInit,
-                                         /*Name=*/"__loadtime_comment_str");
+                                         GlobalValue::WeakODRLinkage, StrInit,
+                                         /*Name=*/ GlobalName);
         StrGV->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
         StrGV->setAlignment(Align(1));
         // Backend recognizes this section and emits it to .loadtime_comment.
