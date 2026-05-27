@@ -381,6 +381,9 @@ exit:
   ret i32 %sum.1
 }
 
+; Tests an abs diff extended operand in a AddChainWithSubs reduction, where the
+; abs diff is negated (the operand of the sub). Previously, we'd crash handling
+; this as we would fail to match the negated abs diff.
 define i32 @sub_add_chain_unsigned_absolute_difference(ptr noalias %x, ptr noalias %y) {
 ; CHECK-LABEL: define i32 @sub_add_chain_unsigned_absolute_difference(
 ; CHECK-SAME: ptr noalias [[X:%.*]], ptr noalias [[Y:%.*]]) #[[ATTR0]] {
