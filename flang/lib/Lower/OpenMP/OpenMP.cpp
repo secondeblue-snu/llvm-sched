@@ -433,13 +433,16 @@ static void bindEntryBlockArgs(lower::AbstractConverter &converter,
               .first);
   };
 
-  // Process in clause name alphabetical order to match block arguments order.
   // Do not bind host_eval variables because they cannot be used inside of the
   // corresponding region, except for very specific cases handled separately.
+  // Bind map before in_reduction so that for target in_reduction list items
+  // (which are also implicitly mapped), the in_reduction binding wins and
+  // in-body references use the reduction-private block argument, not the
+  // mapped/original address.
   bindMapLike(args.hasDeviceAddr.objects, op.getHasDeviceAddrBlockArgs());
+  bindMapLike(args.map.objects, op.getMapBlockArgs());
   bindPrivateLike(args.inReduction.objects, args.inReduction.vars,
                   op.getInReductionBlockArgs());
-  bindMapLike(args.map.objects, op.getMapBlockArgs());
   bindPrivateLike(args.priv.objects, args.priv.vars, op.getPrivateBlockArgs());
   bindPrivateLike(args.reduction.objects, args.reduction.vars,
                   op.getReductionBlockArgs());
@@ -1873,6 +1876,7 @@ genTargetClauses(lower::AbstractConverter &converter,
                  mlir::omp::TargetOperands &clauseOps,
                  DefaultMapsTy &defaultMaps,
                  llvm::SmallVectorImpl<Object> &hasDeviceAddrObjects,
+                 llvm::SmallVectorImpl<Object> &inReductionObjects,
                  llvm::SmallVectorImpl<Object> &isDevicePtrObjects,
                  llvm::SmallVectorImpl<Object> &mapObjects) {
   ClauseProcessor cp(converter, semaCtx, clauses);
@@ -1887,13 +1891,14 @@ genTargetClauses(lower::AbstractConverter &converter,
     hostEvalInfo->collectValues(clauseOps.hostEvalVars);
   }
   cp.processIf(llvm::omp::Directive::OMPD_target, clauseOps);
+  cp.processInReduction(loc, clauseOps, inReductionObjects);
   cp.processIsDevicePtr(stmtCtx, clauseOps, isDevicePtrObjects);
   cp.processMap(loc, stmtCtx, clauseOps, llvm::omp::Directive::OMPD_unknown,
                 &mapObjects);
   cp.processNowait(clauseOps);
   cp.processThreadLimit(stmtCtx, clauseOps);
 
-  cp.processTODO<clause::Allocate, clause::InReduction, clause::UsesAllocators>(
+  cp.processTODO<clause::Allocate, clause::UsesAllocators>(
       loc, llvm::omp::Directive::OMPD_target);
 
   // `target private(..)` is only supported in delayed privatization mode.
@@ -2932,10 +2937,10 @@ genTargetOp(lower::AbstractConverter &converter, lower::SymMap &symTable,
   mlir::omp::TargetOperands clauseOps;
   DefaultMapsTy defaultMaps;
   llvm::SmallVector<Object> mapObjects, hasDeviceAddrObjects,
-      isDevicePtrObjects;
+      inReductionObjects, isDevicePtrObjects;
   genTargetClauses(converter, semaCtx, symTable, stmtCtx, eval, item->clauses,
                    loc, clauseOps, defaultMaps, hasDeviceAddrObjects,
-                   isDevicePtrObjects, mapObjects);
+                   inReductionObjects, isDevicePtrObjects, mapObjects);
 
   if (!isDevicePtrObjects.empty()) {
     // is_device_ptr maps get duplicated so the clause and synthesized
@@ -3108,6 +3113,58 @@ genTargetOp(lower::AbstractConverter &converter, lower::SymMap &symTable,
           Object{const_cast<semantics::Symbol *>(&sym), std::nullopt});
     }
   };
+  // OpenMP requires `in_reduction` list items on `target` to be implicitly
+  // data-mapped. The MLIR -> LLVM IR translation passes the mapped pointer
+  // as the `orig` argument of `__kmpc_task_reduction_get_th_data`, so the
+  // map must be address-preserving regardless of the scalar default capture
+  // (which would otherwise be ByCopy for small scalars and break the
+  // runtime lookup against the enclosing taskgroup's task_reduction
+  // descriptor). Emit these maps before the generic implicit-map walk so
+  // that walk treats the symbols as already mapped via
+  // `isDuplicateMappedSymbol` and does not downgrade them to ByCopy.
+  auto captureInReductionImplicitMap = [&](const semantics::Symbol &sym) {
+    if (sym.owner().IsDerivedType())
+      return;
+    if (!converter.getSymbolAddress(sym))
+      return;
+    if (isDuplicateMappedSymbol(sym, dsp.getAllSymbolsToPrivatize(),
+                                hasDeviceAddrObjects, mapObjects,
+                                isDevicePtrObjects))
+      return;
+    if (const auto *details =
+            sym.template detailsIf<semantics::HostAssocDetails>())
+      converter.copySymbolBinding(details->symbol(), sym);
+    std::stringstream name;
+    fir::ExtendedValue dataExv = converter.getSymbolExtendedValue(sym);
+    name << sym.name().ToString();
+    fir::factory::AddrAndBoundsInfo info =
+        Fortran::lower::getDataOperandBaseAddr(converter, firOpBuilder,
+                                               sym.GetUltimate(),
+                                               converter.getCurrentLocation());
+    llvm::SmallVector<mlir::Value> bounds =
+        fir::factory::genImplicitBoundsOps<mlir::omp::MapBoundsOp,
+                                           mlir::omp::MapBoundsType>(
+            firOpBuilder, info, dataExv,
+            semantics::IsAssumedSizeArray(sym.GetUltimate()),
+            converter.getCurrentLocation());
+    mlir::Value baseOp = info.rawInput;
+    mlir::omp::ClauseMapFlags flags = mlir::omp::ClauseMapFlags::implicit |
+                                      mlir::omp::ClauseMapFlags::to |
+                                      mlir::omp::ClauseMapFlags::from;
+    mlir::Value mapOp = createMapInfoOp(
+        firOpBuilder, converter.getCurrentLocation(), baseOp,
+        /*varPtrPtr=*/mlir::Value{}, name.str(), bounds, /*members=*/{},
+        /*membersIndex=*/mlir::ArrayAttr{}, flags,
+        mlir::omp::VariableCaptureKind::ByRef, baseOp.getType(),
+        /*partialMap=*/false, /*mapperId=*/mlir::FlatSymbolRefAttr{});
+    clauseOps.mapVars.push_back(mapOp);
+    mapObjects.push_back(
+        Object{const_cast<semantics::Symbol *>(&sym), std::nullopt});
+  };
+  for (const Object &object : inReductionObjects)
+    if (const semantics::Symbol *sym = object.sym())
+      captureInReductionImplicitMap(*sym);
+
   lower::pft::visitAllSymbols(eval, captureImplicitMap);
 
   auto targetOp = mlir::omp::TargetOp::create(firOpBuilder, loc, clauseOps);
@@ -3120,7 +3177,8 @@ genTargetOp(lower::AbstractConverter &converter, lower::SymMap &symTable,
   args.hasDeviceAddr.objects = hasDeviceAddrObjects;
   args.hasDeviceAddr.vars = hasDeviceAddrBaseValues;
   args.hostEvalVars = clauseOps.hostEvalVars;
-  // TODO: Add in_reduction syms and vars.
+  args.inReduction.objects = inReductionObjects;
+  args.inReduction.vars = clauseOps.inReductionVars;
   args.map.objects = mapObjects;
   args.map.vars = mapBaseValues;
   args.priv.objects = makeObjects(dsp.getDelayedPrivSymbols());

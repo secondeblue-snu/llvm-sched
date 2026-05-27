@@ -490,7 +490,11 @@ static LogicalResult checkImplementationStatus(Operation &op) {
       .Case([&](omp::TargetOp op) {
         checkAllocate(op, result);
         checkBare(op, result);
-        checkInReduction(op, result);
+        // in_reduction(byref(...)) on target is not implemented yet. Other
+        // unsupported in_reduction shapes (cleanup region, two-argument
+        // initializer, missing combiner) and the device-side / offload-entry
+        // cases are diagnosed inline in convertOmpTarget.
+        checkInReductionByref(op, result);
         checkThreadLimit(op, result);
       })
       .Default([](Operation &) {
@@ -8222,6 +8226,61 @@ convertOmpTarget(Operation &opInst, llvm::IRBuilderBase &builder,
   bool isOffloadEntry =
       isTargetDevice || !ompBuilder->Config.TargetTriples.empty();
 
+  // Validate and resolve in_reduction clauses on omp.target. We currently
+  // only support the non-offload host-fallback path: the per-task private
+  // pointer is obtained by calling __kmpc_task_reduction_get_th_data inside
+  // the to-be-outlined target task body. Threading that pointer through the
+  // device kernel argument list is left as follow-up work.
+  SmallVector<llvm::Value *> inRedOrigPtrs;
+  if (!targetOp.getInReductionVars().empty()) {
+    if (isTargetDevice || isOffloadEntry)
+      return opInst.emitError(
+          "not yet implemented: in_reduction clause on omp.target with "
+          "offload / target-device compilation");
+    if (auto inRedSyms = targetOp.getInReductionSyms()) {
+      for (auto sym : inRedSyms->getAsRange<SymbolRefAttr>()) {
+        auto decl =
+            SymbolTable::lookupNearestSymbolFrom<omp::DeclareReductionOp>(
+                targetOp, sym);
+        if (!decl)
+          return targetOp.emitError()
+                 << "failed to resolve in_reduction declare_reduction symbol "
+                 << sym.getRootReference() << " on omp.target";
+        if (decl.getInitializerRegion().front().getNumArguments() != 1)
+          return targetOp.emitError()
+                 << "not yet implemented: in_reduction with two-argument "
+                    "initializer on omp.target";
+        if (!decl.getCleanupRegion().empty())
+          return targetOp.emitError()
+                 << "not yet implemented: in_reduction with cleanup region "
+                    "on omp.target";
+        // The reduction combiner region is intentionally not required here:
+        // the in_reduction lowering on omp.target only locates the per-task
+        // private storage via __kmpc_task_reduction_get_th_data. The combiner
+        // is owned by the enclosing taskgroup's task_reduction registration.
+      }
+    }
+    // Each in_reduction variable must also be captured by the target via a
+    // map_entries entry referring to the same outer SSA value. OMPIRBuilder
+    // outlines the target body and only rewires uses of values that enter
+    // the kernel through the map-derived input set. The runtime call below
+    // uses that same outer SSA value as its `orig` argument, so without a
+    // matching map entry the outlined kernel would reference a value defined
+    // in the host function and fail IR verification.
+    llvm::SmallPtrSet<Value, 4> mappedVarPtrs;
+    for (Value mapV : targetOp.getMapVars())
+      if (auto mapInfo = mapV.getDefiningOp<omp::MapInfoOp>())
+        mappedVarPtrs.insert(mapInfo.getVarPtr());
+    inRedOrigPtrs.reserve(targetOp.getInReductionVars().size());
+    for (Value v : targetOp.getInReductionVars()) {
+      if (!mappedVarPtrs.contains(v))
+        return targetOp.emitError()
+               << "not yet implemented: in_reduction variable on omp.target "
+                  "must also be captured by a matching map_entries entry";
+      inRedOrigPtrs.push_back(moduleTranslation.lookupValue(v));
+    }
+  }
+
   // For some private variables, the MapsForPrivatizedVariablesPass
   // creates MapInfoOp instances. Go through the private variables and
   // the mapped variables so that during codegeneration we are able
@@ -8333,6 +8392,36 @@ convertOmpTarget(Operation &opInst, llvm::IRBuilderBase &builder,
             privateVarsInfo.llvmVars, privateVarsInfo.privatizers,
             targetOp.getPrivateNeedsBarrier(), &mappedPrivateVars)))
       return llvm::make_error<PreviouslyReportedError>();
+
+    // Map in_reduction block arguments to the per-task private storage
+    // returned by __kmpc_task_reduction_get_th_data. The lookup must run
+    // inside the target task body so the gtid corresponds to the executing
+    // thread. The descriptor argument is NULL: the runtime walks enclosing
+    // taskgroups to locate the matching task_reduction registration for
+    // `origPtr`. Mirrors the in_reduction handling on omp.taskloop.context.
+    ArrayRef<BlockArgument> inRedBlockArgs = argIface.getInReductionBlockArgs();
+    if (!inRedBlockArgs.empty()) {
+      llvm::OpenMPIRBuilder &ompB = *moduleTranslation.getOpenMPBuilder();
+      llvm::Module *m = moduleTranslation.getLLVMModule();
+      llvm::LLVMContext &llvmCtx = m->getContext();
+      uint32_t srcLocSize;
+      llvm::Constant *srcLocStr = ompB.getOrCreateDefaultSrcLocStr(srcLocSize);
+      llvm::Value *bodyIdent = ompB.getOrCreateIdent(srcLocStr, srcLocSize);
+      llvm::Function *gtidFn = ompB.getOrCreateRuntimeFunctionPtr(
+          llvm::omp::OMPRTL___kmpc_global_thread_num);
+      llvm::Value *bodyGtid =
+          builder.CreateCall(gtidFn, {bodyIdent}, "omp_global_thread_num");
+      llvm::FunctionCallee getThData = ompB.getOrCreateRuntimeFunction(
+          *m, llvm::omp::OMPRTL___kmpc_task_reduction_get_th_data);
+      llvm::Type *ptrTy = llvm::PointerType::getUnqual(llvmCtx);
+      llvm::Value *nullDesc = llvm::ConstantPointerNull::get(ptrTy);
+      for (auto [blockArg, origPtr] :
+           llvm::zip_equal(inRedBlockArgs, inRedOrigPtrs)) {
+        llvm::Value *priv = builder.CreateCall(
+            getThData, {bodyGtid, nullDesc, origPtr}, "omp.inred.priv");
+        moduleTranslation.mapValue(blockArg, priv);
+      }
+    }
 
     LLVM::ModuleTranslation::SaveStack<OpenMPAllocStackFrame> frame(
         moduleTranslation, allocaIP, deallocBlocks);

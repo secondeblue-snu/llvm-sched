@@ -2545,8 +2545,7 @@ LogicalResult TargetUpdateOp::verify() {
 void TargetOp::build(OpBuilder &builder, OperationState &state,
                      const TargetOperands &clauses) {
   MLIRContext *ctx = builder.getContext();
-  // TODO Store clauses in op: allocateVars, allocatorVars, inReductionVars,
-  // inReductionByref, inReductionSyms.
+  // TODO Store clauses in op: allocateVars, allocatorVars.
   TargetOp::build(
       builder, state, /*allocate_vars=*/{}, /*allocator_vars=*/{}, clauses.bare,
       makeArrayAttr(ctx, clauses.dependKinds), clauses.dependVars,
@@ -2554,9 +2553,10 @@ void TargetOp::build(OpBuilder &builder, OperationState &state,
       clauses.device, clauses.dynGroupprivateAccessGroup,
       clauses.dynGroupprivateFallback, clauses.dynGroupprivateSize,
       clauses.hasDeviceAddrVars, clauses.hostEvalVars, clauses.ifExpr,
-      /*in_reduction_vars=*/{}, /*in_reduction_byref=*/nullptr,
-      /*in_reduction_syms=*/nullptr, clauses.isDevicePtrVars, clauses.mapVars,
-      clauses.nowait, clauses.privateVars,
+      clauses.inReductionVars,
+      makeDenseBoolArrayAttr(ctx, clauses.inReductionByref),
+      makeArrayAttr(ctx, clauses.inReductionSyms), clauses.isDevicePtrVars,
+      clauses.mapVars, clauses.nowait, clauses.privateVars,
       makeArrayAttr(ctx, clauses.privateSyms), clauses.privateNeedsBarrier,
       clauses.threadLimitVars,
       /*private_maps=*/nullptr);
@@ -2581,6 +2581,11 @@ LogicalResult TargetOp::verify() {
     return failure();
 
   if (failed(verifyPrivateVarList(*this)))
+    return failure();
+
+  if (failed(verifyReductionVarList(*this, getInReductionSyms(),
+                                    getInReductionVars(),
+                                    getInReductionByref())))
     return failure();
 
   return verifyPrivateVarsMapping(*this);
