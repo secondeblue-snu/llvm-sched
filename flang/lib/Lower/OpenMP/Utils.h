@@ -237,11 +237,15 @@ llvm::omp::TraitSelector
 mapTraitSelector(const parser::OmpTraitSelectorName &name,
                  llvm::omp::TraitSet set);
 
-void makeVariantMatchInfo(llvm::omp::VariantMatchInfo &vmi,
-                          const parser::modifier::OmpContextSelector &ctxSel,
-                          semantics::SemanticsContext &semaCtx,
-                          mlir::Location loc,
-                          const parser::ScalarExpr *&dynamicCondExpr);
+struct DynamicUserCondition {
+  const parser::ScalarExpr *expr;
+  parser::CharBlock source;
+};
+
+std::optional<DynamicUserCondition>
+makeVariantMatchInfo(llvm::omp::VariantMatchInfo &vmi,
+                     const parser::modifier::OmpContextSelector &ctxSel,
+                     semantics::SemanticsContext &semaCtx, mlir::Location loc);
 
 } // namespace omp
 } // namespace lower
