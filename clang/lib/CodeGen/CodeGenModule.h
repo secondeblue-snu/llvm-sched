@@ -1300,6 +1300,9 @@ public:
   // are needed or if they are alias to each other.
   llvm::Function *codegenCXXStructor(GlobalDecl GD);
 
+  /// Emit a trap stub body for functions in ASTContext::CUDADeviceInvalidFuncs.
+  bool tryEmitCUDADeviceInvalidFunctionBody(GlobalDecl GD, llvm::Function *Fn);
+
   /// Return the address of the constructor/destructor of the given type.
   llvm::Constant *
   getAddrOfCXXStructor(GlobalDecl GD, const CGFunctionInfo *FnInfo = nullptr,
@@ -1859,7 +1862,7 @@ public:
   bool shouldEmitConvergenceTokens() const {
     // TODO: this should probably become unconditional once the controlled
     // convergence becomes the norm.
-    return getTriple().isSPIRVLogical();
+    return getTriple().isSPIRVLogical() || getTriple().isDXIL();
   }
 
   void addUndefinedGlobalForTailCall(
