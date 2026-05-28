@@ -7094,6 +7094,9 @@ The AMDGPU backend supports the following memory models:
     OpenCL memory. The target triple environment is used to determine if the
     source language is OpenCL (see :ref:`amdgpu-opencl`).
 
+The AMDGPU backend does not support atomic accesses with less than natural
+alignment or an access size of more than 64 bits.
+
 ``ds/flat_load/store/atomic`` instructions to local memory are termed LDS
 operations.
 
