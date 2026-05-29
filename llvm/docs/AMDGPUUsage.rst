@@ -2077,6 +2077,18 @@ Example:
 
   !0 = !{ !"agent" }
 
+.. _amdgpu_unsupported_constructs:
+
+Unsupported IR Constructs
+-------------------------
+
+The following LLVM IR constructs are not supported by the AMDGPU backend:
+
+* atomic accesses with less than natural alignment or an access size of
+  more than 64 bits
+
+This list is not exhaustive.
+
 .. _amdgpu_metadata:
 
 LLVM IR Metadata
@@ -7093,9 +7105,6 @@ The AMDGPU backend supports the following memory models:
     space. The code sequences in the table indicate what can be omitted for the
     OpenCL memory. The target triple environment is used to determine if the
     source language is OpenCL (see :ref:`amdgpu-opencl`).
-
-The AMDGPU backend does not support atomic accesses with less than natural
-alignment or an access size of more than 64 bits.
 
 ``ds/flat_load/store/atomic`` instructions to local memory are termed LDS
 operations.
