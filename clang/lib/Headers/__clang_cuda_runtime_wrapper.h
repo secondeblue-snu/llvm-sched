@@ -28,6 +28,18 @@
 
 #if defined(__CUDA__) && defined(__clang__)
 
+// MSVC STL Update 202604L introduces constexpr math comparison functions. On
+// HIP, constexpr implies __host__ and __device__. Our __device__ overloads
+// clash with these definitions. The functions are: isfinite, isinf, isnan,
+// isnormal, isunordered, isgreater, isgreaterequal, isless, islessequal,
+// islessgreater. The <version> header is fairly recent. Since the problem is
+// only present in recent versions of the STL we can safely ignore the
+// workaround for older versions.
+#if defined(__HIP__) && __has_include("version")
+#include <version>
+#define __HAS_CONSTEXPR_MATH_CMP_FUNCTIONS (_MSVC_STL_UPDATE >= 202604L)
+#endif
+
 // Include some forward declares that must come before cmath.
 #include <__clang_cuda_math_forward_declares.h>
 
@@ -40,6 +52,8 @@
 // while some required macros (like __THROW) are in a weird state.
 #include <climits>
 #include <cmath>
+#undef __HAS_CONSTEXPR_MATH_CMP_FUNCTIONS
+
 #include <cstdlib>
 #include <stdlib.h>
 #include <string.h>

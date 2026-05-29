@@ -65,6 +65,8 @@ __DEVICE__ float frexp(float __arg, int *__exp) {
   return ::frexpf(__arg, __exp);
 }
 
+#if !__HAS_CONSTEXPR_MATH_CMP_FUNCTIONS
+
 // For inscrutable reasons, the CUDA headers define these functions for us on
 // Windows.
 #if !defined(_MSC_VER) || defined(__OPENMP_NVPTX__)
@@ -152,6 +154,9 @@ __DEVICE__ bool isunordered(float __x, float __y) {
 __DEVICE__ bool isunordered(double __x, double __y) {
   return __builtin_isunordered(__x, __y);
 }
+
+#endif // !__HAS_CONSTEXPR_MATH_CMP_FUNCTIONS
+
 __DEVICE__ float ldexp(float __arg, int __exp) {
   return ::ldexpf(__arg, __exp);
 }

@@ -89,6 +89,7 @@ __DEVICE__ double hypot(double, double);
 __DEVICE__ float hypot(float, float);
 __DEVICE__ int ilogb(double);
 __DEVICE__ int ilogb(float);
+#if !__HAS_CONSTEXPR_MATH_CMP_FUNCTIONS
 #ifdef _MSC_VER
 __DEVICE__ bool isfinite(long double);
 #endif
@@ -118,6 +119,7 @@ __DEVICE__ bool isnormal(double);
 __DEVICE__ bool isnormal(float);
 __DEVICE__ bool isunordered(double, double);
 __DEVICE__ bool isunordered(float, float);
+#endif // !__HAS_CONSTEXPR_MATH_CMP_FUNCTIONS
 __DEVICE__ long labs(long);
 __DEVICE__ double ldexp(double, int);
 __DEVICE__ float ldexp(float, int);
